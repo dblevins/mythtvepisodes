@@ -1,0 +1,31 @@
+Download the latest version, install next to mythfilldatabase and link
+it to the name 'mythtvepisodes'.  I'll be updating the script
+periodically and will keep track of version numbers etc.  Here is the
+current list:
+
+  lrwxrwxrwx    1 dblevins users          18 Mar 24 18:25 mythtvepisodes -> mythtvepisodes-1.0
+  -rw-r--r--    1 dblevins users       10230 Mar 24 18:24 mythtvepisodes-1.0
+  -rw-r--r--    1 dblevins users          67 Mar 24 18:29 README
+
+The script requires the Perl DBI module to run.
+
+Once the script is installed, run setup.
+
+  % mythtvepisodes -setup
+
+You can then add it to your crontab to run after mythfilldatabase. For
+example:
+
+
+  30 5 * * *     mythfilldatabase > /dev/null
+  45 5 * * *     mythtvepisodes
+
+Then just type -help for usage info on setting up tv shows.
+
+  % mythtvepisodes -help
+
+I've tested it with 'Buffy the Vampire Slayer', 'Angle', 'Futurama',
+'Smallville', and 'Farscape' with good success.  Occationally the data
+from epguides.com doesn't match that from XMLTV and shows get recorded
+that were supposed to be skipped.  Doesn't happen very often and it's
+pretty easy just to delete them afterwards.

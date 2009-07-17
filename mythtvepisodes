@@ -1,0 +1,374 @@
+#!/usr/bin/perl -w
+################################################################
+#
+#  Calling this script with a parameter results in data for a 
+#  given tv show being screen scraped from epguides.com and
+#  added to the episode table.
+#
+#  Calling this script without a parameter results in the  
+#  program table being checked for shows that need to be marked
+#  as already recorded so we can avoid recording episodes we 
+#  don't want.
+# 
+################################################################
+ 
+
+#########################################
+#
+#  Setup DBI Connection
+#
+#########################################
+use DBI;
+
+my $user = 'mythtv';
+my $password = 'mythtv';
+my $driver = "mysql";
+my $database = 'mythconverg';
+my $hostname = 'localhost';
+my $dsn = "DBI:$driver:database=$database;host=$hostname";
+   
+# Open a connection and reuse it
+$dbh = DBI->connect($dsn, $user, $password);
+
+$YEAR=`date +%Y`;
+%MONTHS = (
+      Jan => '01',
+      Feb => '02',
+      Mar => '03',
+      Apr => '04',
+      May => '05',
+      Jun => '06',
+      Jul => '07',
+      Aug => '08',
+      Sep => '09',
+      Oct => '10',
+      Nov => '11',
+      Dec => '12',
+      );
+
+$SELECT = <<_SQL_;
+SELECT p.chanid, p.starttime, p.endtime, p.title, p.subtitle, p.description, p.category  
+FROM program p, episode e
+WHERE  e.title = ?
+   AND e.skip = 1
+   AND p.title = e.title 
+   AND p.subtitle = e.subtitle 
+_SQL_
+
+$REPLACE = <<_SQL_;
+REPLACE INTO oldrecorded (chanid, starttime, endtime, title, subtitle, description, category) 
+VALUES (?, ?, ?, ?, ?, ?, ?)
+_SQL_
+
+$CREATE = <<_CREATE_;
+CREATE TABLE episode
+(
+    season INT UNSIGNED NOT NULL,
+    num INT UNSIGNED NOT NULL,
+    airdate DATE NOT NULL,
+    title VARCHAR(128) NOT NULL,
+    subtitle VARCHAR(128) NOT NULL,
+    description TEXT NULL,
+    skip INT DEFAULT 0 NOT NULL,
+    PRIMARY KEY (season, num, title)
+)
+_CREATE_
+#########################################
+#
+#  Functions
+#
+#########################################
+sub help {
+    system("perldoc mythtvepisodes") && die "\nmythtvepisodes: perldoc: $?\n";
+    exit;
+}
+
+
+sub addepisodes {
+
+   my $stmt = "replace into episode (season, num, airdate, title, subtitle) values (?, ?, ?, ?, ?)";
+   my $sth = $dbh->prepare($stmt);
+   
+   foreach my $show (@_) {
+      foreach (getShowData( $show )) {
+          my ($season, $num, $airdate, $title, $subtitle) = split('\t', $_);
+          #print "$season, $num, $airdate, $title, $subtitle\n";
+          $sth ->execute($season, $num, $airdate, $title, $subtitle);
+      }
+   }
+   
+   $sth->finish();
+}
+
+sub getShowData {
+   my $show = shift;
+   my $showid = $show;
+   $showid =~ s/^The |[^A-Za-z0-9]//g;
+   
+   my @rows;
+   my $URL="http://www.epguides.com/$showid/";
+   
+   #print $URL . "\n";
+
+   open (PAGE, "wget -q -O - $URL | tr '\r' '\n' |") or die "Cannot download $URL : $!\n";
+   while(<PAGE>){
+       next unless / *[0-9]+\. +/;
+       next if /UNAIRED/;
+       chomp;
+       my ($season, $num, $airdate, $subtitle) = /([0-9]+)- ?([0-9]+).* +([0-9]{1,2} [A-Sa-z]{3} [0-9]{2}).*<[^>]+>(.*)<[^>]+>/;
+       $airdate = fixDate($airdate);
+       $subtitle =~ s/ \(a\.k\.a\..*//;
+   
+       my $row = join("\t", $season, $num, $airdate, $show, $subtitle);
+       push @rows, $row;
+   }
+   close PAGE;
+   return @rows;
+}
+
+sub fixDate {
+    my ($day, $month, $year) = split(' ', shift);
+    
+    $day = "0$day" if $day =~ /^.$/;
+    $month = $MONTHS{$month};
+    $year = "20$year";
+    $year =~ s/^20/19/ if $year > $YEAR;
+    return "$year-$month-$day";
+}
+
+
+sub markrecorded {
+#   my $write = $dbh->prepare("DELETE FROM oldrecorded WHERE title = ? and subtitle = ?");
+   my $write = $dbh->prepare($REPLACE);
+   
+   foreach my $title ( getTitles() ){
+      my @eps = getRecordedEpisodes($title);
+      my $read  = $dbh->prepare(addPlaceholders($SELECT, @eps));
+      $read ->execute($title, @eps);
+      
+      my ($chanid, $starttime, $endtime, $title, $subtitle, $description, $category);
+      $read->bind_columns( undef, \$chanid, \$starttime, \$endtime, \$title, \$subtitle, \$description, \$category );
+      
+      my %episodes;
+      while( $read->fetch() ) {
+         unless ($episodes{$subtitle}++) {
+            #print "\n$chanid, $starttime, $endtime, $title, $subtitle, $description, $category\n";
+            $write->execute($chanid, $starttime, $endtime, $title, $subtitle, $description, $category);         
+         }
+      }
+      $read->finish();
+      $write->finish();
+   }
+}
+
+sub addPlaceholders {
+   my $sql = shift;
+   my @values = @_;
+
+   if (@values > 0) {  ### Having to do this blows!
+      $sql .= ' AND p.subtitle NOT IN (';
+      foreach (@values) {
+         $sql .= '?,';
+      }
+      $sql =~ s/,$/)/;
+   }
+   return $sql;
+}
+
+sub getTitles {
+   my $sth = $dbh->prepare("SELECT DISTINCT title FROM episode");
+   $sth ->execute();
+   
+   my @titles;
+   my $title;
+   $sth->bind_columns( undef, \$title );
+   
+   while( $sth->fetch() ) {
+      push @titles, $title;
+   }
+   $sth->finish();
+   return @titles;
+}
+
+sub getRecordedEpisodes {
+   my $title = shift;
+
+   my $sth = $dbh->prepare("SELECT subtitle FROM oldrecorded WHERE title = ?");
+   $sth ->execute($title);
+   
+   my @subtitles;
+   my $subtitle;
+   $sth->bind_columns( undef, \$subtitle );
+   
+   while( $sth->fetch() ) {
+     push @subtitles, $subtitle;
+   }
+   
+   $sth->finish();
+   return @subtitles;
+}
+
+sub skipseasons {
+   my ($title, @seasons) = @_;
+   my $seasonlist;
+
+   my $sql = "UPDATE episode SET skip = 1 WHERE title = ? AND season IN ( ";
+   foreach (@seasons) {
+      $sql .= "$_, ";
+   }
+   $sql =~ s/, $/)/;
+
+   my $sth = $dbh->prepare($sql);
+
+   $sth ->execute($title);
+   $sth->finish();
+
+}
+
+sub showepisodes {
+   my $tvshow = shift;
+   my $sth  = $dbh->prepare("SELECT skip, season, num, airdate, title, subtitle FROM episode WHERE title = ? ORDER BY season, num");
+   $sth->execute($tvshow);
+   
+   my ($skip, $season, $num, $airdate, $title, $subtitle);
+   $sth->bind_columns( undef, \$skip, \$season, \$num, \$airdate, \$title, \$subtitle);
+   
+   my @skipsymbol = (' ', 'x');
+   my $pre;
+   my %episodes;
+   while( $sth->fetch() ) {
+      print "\nSeason $season\n" unless $season =~ /$pre/;
+      my $ep = "$season.$num";
+      print sprintf ("%s  %-5s  %-40.40s  %-20.20s  %s", $skipsymbol[$skip], $ep, $subtitle, $title, $airdate )."\n";
+      $pre = $season;
+   }
+   $sth->finish();
+}
+
+sub setupdb {
+   my $sth  = $dbh->prepare($CREATE);
+   $sth->execute();
+   $sth->finish();
+}
+
+################################################################
+#
+#  M A I N
+#
+################################################################
+
+$command = shift;
+   
+if ($command) {
+   help() if $command =~ /-help/;
+   skipseasons( @ARGV ) if $command =~ /-skip/;
+   #dontskipseasons ( @ARGV ) if $command =~ /-unskip/;
+   addepisodes ( @ARGV ) if $command =~ /-add|-update/;
+   showepisodes ( @ARGV ) if $command =~ /-show/;
+   setupdb() if  $command =~ /-setup/;
+} else {
+   markrecorded();
+}
+
+$dbh->disconnect();
+
+=head1 NAME
+
+B<mythtvepisodes> - Adds minor episode guide ability
+to MythTV.
+
+=head1 DESCRIPTION
+
+Run it after mythfilldatabase and it will trim out unwanted 
+episodes from shows you are recording.  Episode information 
+is stored in a new C<episode> table which is populated with 
+data from epguides.com.  Once you populate the episode table 
+and mark the episodes you don't want, you just setup this script
+in your crontab file and forget about it.
+
+Because the data comes from epguides.com, episode names may not
+always match.  The only affect of that is sometimes episodes 
+get recorded when they should be skipped.
+
+=head1 OPTIONS
+
+=over 
+
+=item B<-help>
+
+Display this message and exit.
+
+=item B<-setup>
+
+Adds the C<episode> table to the mythconverg database. This only needs
+to be done once.
+
+=item B<-add> <showname>
+
+Screen scrapes <showname> from epguides.com and populates the
+C<episode> table with the episode and season data.  This is usually
+done once per show.
+
+=item B<-skip> <showname> n1 n2...
+
+Marks the specified seasons of the show as unwanted.  
+
+=item B<-show> <showname>
+
+Lists the show's epidode information grouped by season with C<x>
+before any episodes that shoul be skipped.
+
+=item <no-params>
+
+When run with no parameters, B<mythtvepisodes> will search the
+C<program> table for any episodes of seasons you have previously
+flagged with the -skip command.  The unwanted episodes will be added
+to the C<oldrecorded> table and show up as duplicates.
+
+=back
+
+=head1 PREREQUISITES
+
+The C<DBI> modules are required for connecting to the MythTV database.
+
+=head1 EXAMPLES
+
+Say you like C<Buffy the Vampire Slayer> and want to capture the show,
+but already have several seasons on DVD.  You can use
+B<mythtvepisodes> to mark the unwanted seasons as having already
+been recorded.  Then they will appear as duplicates and the MythTV
+scheduler will not record them.  The following commands would set that
+up for you.
+
+  % mythtvepisodes -add "Buffy the Vampire Slayer"
+
+This will download the page
+C<http://www.epguides.com/BuffytheVampireSlayer/> and the episode data
+to the mythconverg database.
+
+  % mythtvepisodes -skip "Buffy the Vampire Slayer" 1 2 3 4 5
+
+Marks seasons 1, 2, 3, 4, and 5 as unwanted.
+
+  % mythtvepisodes -show "Buffy the Vampire Slayer"
+
+Lists the episode information in the database with C<x> before the
+unwanted episodes.  Not required, but nice to see everything is ok.
+
+  % mythtvepisodes
+
+Checks the database for shows that should be skipped and adds them to
+oldrecorded.  This should be done from cron after mythfilldatabase is
+run or whenever you add new shows to the episode table as above.
+
+=head1 AUTHOR
+
+David Blevins <david.blevins@visi.com>
+
+=head1 COPYRIGHT
+
+Copyright (c) 2004 David Blevins. All rights reserved. This program is
+free software; you can redistribute it and/or modify it under the same
+terms as Perl itself.
+
+=cut
